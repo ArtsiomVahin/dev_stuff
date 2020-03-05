@@ -1,0 +1,341 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+
+    config.vm.define "inspec_slave" do |inspec_slave|    
+        inspec_slave.vm.box = "centos/7"
+        inspec_slave.vm.network "private_network", ip: "192.168.33.30"
+        inspec_slave.vm.hostname = "inspec-slave-01"
+
+        inspec_slave.ssh.keys_only = "false"
+
+        inspec_slave.vm.provision "shell", inline: <<-SHELL
+            start=$(date +%s)
+
+            # ssh -o StrictHostKeyChecking=no vagrant@192.168.33.30
+            
+            sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+            sudo systemctl restart sshd
+
+            # install some basic development tools 
+            sudo yum update -y
+            sudo yum groupinstall "Development tools" -y
+            sudo yum install zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl-devel xz xz-devel libffi-devel -y
+
+            # install inspec & accept license
+            curl https://omnitruck.chef.io/install.sh | sudo bash -s -- -P inspec
+            inspec --chef-license=accept
+
+            # Jenkin slave setup
+            # http://yallalabs.com/devops/how-to-add-linux-slave-node-agent-node-jenkins/
+            sudo yum install java-1.8.0-openjdk -y
+            sudo useradd -md /home/jenkins_inspec_slave jenkins_inspec_slave
+            echo "123" | sudo passwd jenkins_inspec_slave --stdin
+
+            # creating necessary files and dirs for keys
+            mkdir /home/jenkins_inspec_slave/.ssh/
+            
+            # creating key for Master -> Slave connectivity and setting correct permissions
+            sudo ssh-keygen -f /home/jenkins_inspec_slave/.ssh/id_rsa -t rsa -P '' -C "Jenkins key for slave connectivity"
+            sudo cat /home/jenkins_inspec_slave/.ssh/id_rsa.pub >> /home/jenkins_inspec_slave/.ssh/authorized_keys
+            sudo chown -R jenkins_inspec_slave:jenkins_inspec_slave /home/jenkins_inspec_slave/
+            sudo chmod 600 /home/jenkins_inspec_slave/.ssh/id_rsa
+
+            end=$(date +%s)
+            echo "I took $((end-start)) seconds to run the set up of Inspec"
+            
+
+        SHELL
+    end
+
+    config.vm.define "jenkins" do |jenkins|
+
+        jenkins.vm.box = "centos/6"
+        jenkins.vm.network "private_network", ip: "192.168.33.20"
+        # jenkins.vm.network "public_network", ip: "192.168.33.20"
+        # jenkins.vm.network "public_network", ip: "10.113.204.30"
+        # jenkins.vm.network "public_network"
+        jenkins.vm.network "forwarded_port", guest: 8080, host: 8080
+        # jenkins.vm.network "forwarded_port", guest: 80, host: 8080
+
+        jenkins.vm.hostname = "jenkins-master-01"
+        jenkins.ssh.keys_only = "false"
+
+        jenkins.vm.provision "shell", inline: <<-SHELL
+            # could add function to derive IP if not specified
+            # ip addr | grep grepovich preporov
+            JENKINS_URL='http://192.168.33.20:8080/'
+
+            start=$(date +%s)
+            ################ Function definitions ###########################
+            wait_for_jenkins_up () {
+                exit_code=1
+                times_waited=1
+                while [ $exit_code -ne 0 ]
+                do
+                    echo "Waiting for Jenkins to start. Waiting 30 seconds..."
+                    sleep 30
+                    curl ${JENKINS_URL}  | egrep "(You are authenticated as: anonymous|Jenkins is currently unsecured|log in)"
+                    exit_code=$?
+                    echo "Waited $((times_waited*30)) for startup..."
+                    let times_waited+=1
+                done
+            }
+
+            install_plugin () {
+                # $1: Admin username
+                # $2: Admin password
+                # $3: Short name of plugin
+
+                java -jar /home/vagrant/jenkins-cli.jar -auth $1:$2 -s ${JENKINS_URL} install-plugin "$3" -deploy
+            }
+
+            intall_all_plugins_from_file () {
+                # $1: Admin username
+                # $2: Admin password
+                # $3: Name of file - must have only plugins in form "plugin-shortname:version"
+
+                while read plugin_data; do
+                    echo "Installing $plugin_data ..."
+                    java -jar /home/vagrant/jenkins-cli.jar -auth $1:$2 -s ${JENKINS_URL} install-plugin "$plugin_data" -deploy
+                done < $3
+            }
+
+            add_user () {
+                # $1: Admin username
+                # $2: Admin password
+                # $3: New user's username
+                # $4: New user's password
+
+                echo "jenkins.model.Jenkins.instance.securityRealm.createAccount('$3', '$4')" | java -jar /home/vagrant/jenkins-cli.jar \
+-auth $1:$2 -s ${JENKINS_URL} groovy =
+            }
+
+            make_venv () {
+                # Can only be ran after system pthon has virtualenv installed
+                # $1: Dir of the virtual env to be created
+                # $2: Python interpretor to use
+
+                mkdir $1
+                python -m virtualenv -p $2 $1
+            }
+            
+            #################################################################
+
+            # install some basic development tools 
+            sudo yum update -y
+            sudo yum groupinstall "Development tools" -y
+            sudo yum install zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl-devel xz xz-devel libffi-devel -y
+            curl https://pyenv.run | bash
+
+            # # installs pip for 2.6
+            wget https://bootstrap.pypa.io/2.6/get-pip.py
+            sudo python get-pip.py
+            rm get-pip.py
+            sudo pip install virtualenv
+
+            # make basic folder for python installs
+            mkdir /home/vagrant/python_downloads
+            mkdir /home/vagrant/python_venvs
+            mkdir /home/vagrant/python_installs
+            
+            # ###################### download, compile, and install Python 3.5.1 from source #######################
+            # cd /home/vagrant/python_downloads
+            # wget https://www.python.org/ftp/python/3.5.1/Python-3.5.1.tgz
+            # # if wget is not available, can always use "curl some/url/file.extension > file.extension"
+            # tar xf Python-3.5.1.tgz
+            # cd Python-3.5.1
+            # ./configure --prefix=/home/vagrant/python_installs/python_3_5_1 --with-ensurepip=install
+            # make
+            # make altinstall
+            
+            # #################################################################
+            # # these steps are not needed for future installs of python3.x
+            # # add symbolic links to python3.5 and pip3
+            # cd /usr/bin
+            # sudo ln -s /home/vagrant/python_installs/python_3_5_1/bin/python3.5 python3
+            # sudo ln -s /home/vagrant/python_installs/python_3_5_1/bin/pip3.5 pip3
+
+            # # install some basic packages 
+            # pip3 install --upgrade pip
+            # pip3 install virtualenv
+            # ########################################################################################################
+
+            # # make python 3.5.1 virtualenv
+            # # mkdir /home/vagrant/python_venvs/python3_5_1_venv
+            # # python -m virtualenv -p /home/vagrant/python_installs/python_3_5_1/bin/python3.5 /home/vagrant/python_venvs/python3_5_1_venv/
+            # make_venv /home/vagrant/python_venvs/python3_5_1_venv /home/vagrant/python_installs/python_3_5_1/bin/python3.5
+
+            # # make python 2.6.6 virtualenv
+            # mkdir /home/vagrant/python_venvs/python2_6_6_venv
+            # python -m virtualenv -p /usr/bin/python /home/vagrant/python_venvs/python2_6_6_venv
+            
+
+            # change owner to vagrant 
+            sudo chown -R vagrant:vagrant /home/vagrant/python_downloads
+            sudo chown -R vagrant:vagrant /home/vagrant/python_venvs
+            sudo chown -R vagrant:vagrant /home/vagrant/python_installs
+
+
+            #################################################################
+            # https://thegeeksalive.com/how-to-install-jenkins-on-centos-servers/
+            # installing jenkins
+            # java stuff
+            yum install java-1.8.0-openjdk-devel.x86_64 -y
+            cp /etc/profile /etc/profile_orig
+            echo -e "export JAVA_HOME=/usr/lib/jvm/jre-1.8.0-openjdk" >> /etc/profile
+            echo -e "export JRE_HOME=/usr/lib/jvm/jre" >> /etc/profile
+            source /etc/profile
+
+            ############## using YUM and CENTOS related commands ##############
+            # installing latest version of jenkins, cos fuck it why not? 
+            # to install specific versions of jenkins follow this post
+            # https://stackoverflow.com/a/36931845/4512359
+            # package location for redhat
+            # http://pkg.jenkins-ci.org/redhat/
+            
+            wget -O /etc/yum.repos.d/jenkins.repo http://pkg.jenkins-ci.org/redhat/jenkins.repo
+            rpm --import https://jenkins-ci.org/redhat/jenkins-ci.org.key
+            yum install jenkins -y
+
+            # starting
+            sudo service jenkins start         # RHEL 6/CentOS 6
+            # systemctl start jenkins.service   # RHEL 7/CentOS 7
+
+            # set Jenkins to run at boot time using the following command:
+            chkconfig jenkins on              # RHEL 6/CentOS 6
+            # systemctl enable jenkins.service  # RHEL 7/CentOS 7
+            ###################################################################
+
+            ############## using WAR files and java commands ##############
+            # # again, latest version
+            # # location for other package versions: http://mirrors.jenkins.io/war/
+            # cd /home/vagrant/
+            # wget /home/vagrant http://mirrors.jenkins.io/war-stable/latest/jenkins.war
+            # nohup java -Djenkins.install.runSetupWizard=false -jar /home/vagrant/jenkins.war &
+            # # this method is not great, beacsue once the server is hutdown (vagrant halt/suspend)
+            # # we need to run the whole configuration again
+            ###############################################################
+
+            # wait for jenkins to start, this can take around 5 mins or less
+            wait_for_jenkins_up
+            # sed cofnig changes won't take effect for some strange reason.
+            # for now, cat'ing it to screen and then editting seems to fix this
+
+            cat /var/lib/jenkins/config.xml
+            echo "Waiting for Jenkins to start properly ..."
+            sleep 30
+            ###############################################################
+            # so this is cool, we now have jenkins installed. Time to start it? Like fuck you are!
+            # Starting it now forces an evil setup wizard to run, and enable security. This killed my automation and 
+            # my motivation. We need to disable it before running the service.
+
+            sudo sed -i -E 's;<installStateName>\w+</installStateName>;<installStateName>RUNNING</installStateName>;g' /var/lib/jenkins/config.xml
+            sudo sed -i -E 's;<installStateName>\w+</installStateName>;<installStateName>RUNNING</installStateName>;g' /var/lib/jenkins/config.xml
+
+
+            # restart the server and let it pick up the new configuration
+            sudo service jenkins restart 
+            wait_for_jenkins_up
+
+            cat /var/lib/jenkins/config.xml
+            ADM_USER=admin
+            ADM_PWD=$(sudo cat /var/lib/jenkins/secrets/initialAdminPassword)
+
+            #############################################################
+            ############## Time to install plugins ##############
+            # we need the jenkins-cli.jar file to do this automatically. 
+            # it's only available after jenkins started
+            # to install plugins run:
+            #   => java -jar jenkins-cli.jar -s http://${jenkins_ip}/ install-plugin 'short-name-of-plugin'
+            # 'short name' is the ID of the plugin, and is found at https://plugins.jenkins.io/short-name
+
+            cd /home/vagrant/
+            wget -O /home/vagrant/jenkins-cli.jar ${JENKINS_URL}jnlpJars/jenkins-cli.jar
+
+            sudo cp -aR /vagrant/plugins/ /var/lib/jenkins/
+            sudo chown -R jenkins:jenkins /var/lib/jenkins/plugins/
+
+            # can likely do this aswell, not tested
+            # intall_all_plugins_from_file $ADM_USER $ADM_PWD /vagrant/plugins.txt
+
+            sudo service jenkins restart          
+            wait_for_jenkins_up
+
+            #############################################################
+            ##################### Adding users ##########################
+            # Enough to make 1 regular user and 1 admin user
+            echo "      Adding users ..."
+            add_user $ADM_USER $ADM_PWD 'user1' '123'
+
+            #############################################################
+            ##################### Adding crdentials #####################
+            echo "      Adding credentials ..."
+            cp /vagrant/credentials.xml /var/lib/jenkins/credentials.xml 
+            sudo chown jenkins:jenkins /var/lib/jenkins/credentials.xml
+
+            sudo cat /var/lib/jenkins/credentials.xml 
+
+            # for some reason this command only works directly from cmd line,
+            # and not from the automation script. For now we'll rely on the copied credentials
+            # java -jar /home/vagrant/jenkins-cli.jar -auth $ADM_USER:$ADM_PWD -s ${JENKINS_URL} create-credentials-by-xml system::system::jenkins _ < /home/vagrant/inspec_credential.xml
+
+            echo '<com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>                                      
+<scope>GLOBAL</scope>
+  <id>test</id>
+  <description></description>
+  <username>test</username>
+  <password>
+    tester
+  </password>                                                                                                            
+</com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>'\
+ | java -jar /home/vagrant/jenkins-cli.jar -auth $ADM_USER:$ADM_PWD -s ${JENKINS_URL} create-credentials-by-xml system::system::jenkins _
+
+            echo '<com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>                                      
+<scope>GLOBAL</scope>
+  <id>inspec-slave-username-password</id>
+  <description></description>
+  <username>jenkins_inspec_slave</username>
+  <password>123</password>                                                                                                            
+</com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>'\
+ | java -jar /home/vagrant/jenkins-cli.jar -auth $ADM_USER:$ADM_PWD -s ${JENKINS_URL} create-credentials-by-xml system::system::jenkins _
+
+
+            #############################################################
+            ##################### Adding slaves #########################
+
+            echo "      Adding slaves ..."
+            NODE_FILES=/vagrant/nodes/*
+            for node_xml in $NODE_FILES
+            do
+                echo "Processing $node_xml file..."
+                java -jar /home/vagrant/jenkins-cli.jar -auth $ADM_USER:$ADM_PWD -s ${JENKINS_URL} create-node < $node_xml
+
+            done
+
+            #############################################################
+            sudo service jenkins restart 
+            wait_for_jenkins_up
+
+            end=$(date +%s)
+            echo "I took $((end-start)) seconds to run the set up of Jenkins"
+            echo "Use the following password to login as admin"
+            echo $ADM_PWD
+
+        SHELL
+    end
+
+    
+
+    config.vm.provision :shell, inline: <<-SHELL
+        # common configurations can go here, probably running updates and stuff
+        # ansible.ssh.username = "vagrant"
+        # ansible.ssh.password = "vagrant"
+        # ansible.ssh.keys_only = "false" 
+    SHELL
+
+
+    # Free IPA client with LDAP
+
+end
